@@ -79,14 +79,14 @@ pub mod impl_macos {
 #[cfg(not(target_os = "dragonfly"))]
 #[cfg(test)]
 mod test {
-    use tokio_core::reactor::Core;
+    use tokio::reactor::Reactor;
     use UnixStream;
     use libc::geteuid;
     use libc::getegid;
 
     #[test]
     fn test_socket_pair() {
-        let core = Core::new().unwrap();
+        let core = Reactor::new().unwrap();
         let handle = core.handle();
 
         let (a, b) = UnixStream::pair(&handle).unwrap();

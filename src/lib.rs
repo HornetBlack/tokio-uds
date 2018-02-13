@@ -16,8 +16,8 @@ extern crate bytes;
 extern crate futures;
 extern crate iovec;
 extern crate libc;
+extern crate tokio;
 #[macro_use]
-extern crate tokio_core;
 extern crate tokio_io;
 extern crate mio;
 extern crate mio_uds;
@@ -36,9 +36,7 @@ use bytes::{Buf, BufMut};
 use futures::{Future, Poll, Async, Stream};
 use futures::sync::oneshot;
 use iovec::IoVec;
-use tokio_core::reactor::{PollEvented, Handle};
-#[allow(deprecated)]
-use tokio_core::io::Io;
+use tokio::reactor::{PollEvented, Handle};
 use tokio_io::{IoStream, AsyncRead, AsyncWrite};
 
 mod frame;
@@ -95,7 +93,7 @@ impl UnixListener {
     }
 
     /// Test whether this socket is ready to be read or not.
-    pub fn poll_read(&self) -> Async<()> {
+    pub fn poll_read(&mut self) -> Async<()> {
         self.io.poll_read()
     }
 
@@ -140,32 +138,14 @@ impl UnixListener {
 
             match try!(self.io.get_ref().accept()) {
                 None => {
-                    self.io.need_read();
+                    self.io.need_read()?;
                     return Err(io::Error::new(io::ErrorKind::WouldBlock,
                                               "not ready"))
                 }
                 Some((sock, addr)) => {
-                    // Fast path if we haven't left the event loop
-                    if let Some(handle) = self.io.remote().handle() {
-                        let io = try!(PollEvented::new(sock, &handle));
-                        return Ok((UnixStream { io: io }, addr))
-                    }
-
-                    // If we're off the event loop then send the socket back
-                    // over there to get registered and then we'll get it back
-                    // eventually.
-                    let (tx, rx) = oneshot::channel();
-                    let remote = self.io.remote().clone();
-                    remote.spawn(move |handle| {
-                        let res = PollEvented::new(sock, handle)
-                            .map(move |io| {
-                                (UnixStream { io: io }, addr)
-                            });
-                        drop(tx.send(res));
-                        Ok(())
-                    });
-                    self.pending_accept = Some(rx);
-                    // continue to polling the `rx` at the beginning of the loop
+                    let handle = self.io.handle();
+                    let io = try!(PollEvented::new(sock, &handle));
+                    return Ok((UnixStream { io: io }, addr))
                 }
             }
         }
@@ -191,7 +171,7 @@ impl UnixListener {
             }
         }
 
-        Incoming { inner: self }.boxed()
+        Box::new(Incoming { inner: self })
     }
 }
 
@@ -220,9 +200,20 @@ impl UnixStream {
     /// Connects to the socket named by `path`.
     ///
     /// This function will create a new unix socket and connect to the path
-    /// specified, performing associating the returned stream with the provided
+    /// specified, associating the returned stream with the default event loop's
+    /// handle.
+    pub fn connect<P>(p: P) -> io::Result<UnixStream>
+        where P: AsRef<Path>
+    {
+        UnixStream::connect_handle(p.as_ref(), &Handle::default())
+    }
+
+    /// Connects to the socket named by `path`.
+    ///
+    /// This function will create a new unix socket and connect to the path
+    /// specified, associating the returned stream with the provided
     /// event loop's handle.
-    pub fn connect<P>(p: P, handle: &Handle) -> io::Result<UnixStream>
+    pub fn connect_handle<P>(p: P, handle: &Handle) -> io::Result<UnixStream>
         where P: AsRef<Path>
     {
         UnixStream::_connect(p.as_ref(), handle)
@@ -263,35 +254,14 @@ impl UnixStream {
         Ok(UnixStream { io: io })
     }
 
-    /// Indicates to this source of events that the corresponding I/O object is
-    /// no longer readable, but it needs to be.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn need_read(&self) {
-        self.io.need_read()
-    }
-
-    /// Indicates to this source of events that the corresponding I/O object is
-    /// no longer writable, but it needs to be.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn need_write(&self) {
-        self.io.need_write()
-    }
 
     /// Test whether this socket is ready to be read or not.
-    pub fn poll_read(&self) -> Async<()> {
+    pub fn poll_read(&mut self) -> Async<()> {
         self.io.poll_read()
     }
 
     /// Test whether this socket is ready to be written to or not.
-    pub fn poll_write(&self) -> Async<()> {
+    pub fn poll_write(&mut self) -> Async<()> {
         self.io.poll_write()
     }
 
@@ -340,61 +310,59 @@ impl Write for UnixStream {
     }
 }
 
-#[allow(deprecated)]
-impl Io for UnixStream {
-    fn poll_read(&mut self) -> Async<()> {
-        <UnixStream>::poll_read(self)
-    }
-
-    fn poll_write(&mut self) -> Async<()> {
-        <UnixStream>::poll_write(self)
-    }
-}
-
 impl AsyncRead for UnixStream {
     unsafe fn prepare_uninitialized_buffer(&self, _: &mut [u8]) -> bool {
         false
     }
 
     fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
-        <&UnixStream>::read_buf(&mut &*self, buf)
+        if let Async::NotReady = <UnixStream>::poll_read(self) {
+            return Ok(Async::NotReady)
+        }
+        unsafe {
+            let r = read_ready(buf, self.as_raw_fd());
+            if r == -1 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    self.io.need_read()?;
+                    Ok(Async::NotReady)
+                } else {
+                    Err(e)
+                }
+            } else {
+                let r = r as usize;
+                buf.advance_mut(r);
+                Ok(r.into())
+            }
+        }
     }
 }
 
 impl AsyncWrite for UnixStream {
     fn shutdown(&mut self) -> Poll<(), io::Error> {
-        <&UnixStream>::shutdown(&mut &*self)
+        Ok(().into())
     }
 
     fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
-        <&UnixStream>::write_buf(&mut &*self, buf)
-    }
-}
-
-impl<'a> Read for &'a UnixStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        (&self.io).read(buf)
-    }
-}
-
-impl<'a> Write for &'a UnixStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        (&self.io).write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        (&self.io).flush()
-    }
-}
-
-#[allow(deprecated)]
-impl<'a> Io for &'a UnixStream {
-    fn poll_read(&mut self) -> Async<()> {
-        <UnixStream>::poll_read(self)
-    }
-
-    fn poll_write(&mut self) -> Async<()> {
-        <UnixStream>::poll_write(self)
+        if let Async::NotReady = <UnixStream>::poll_write(self) {
+            return Ok(Async::NotReady)
+        }
+        unsafe {
+            let r = write_ready(buf, self.as_raw_fd());
+            if r == -1 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    self.io.need_write()?;
+                    Ok(Async::NotReady)
+                } else {
+                    Err(e)
+                }
+            } else {
+                let r = r as usize;
+                buf.advance(r);
+                Ok(r.into())
+            }
+        }
     }
 }
 
@@ -433,34 +401,6 @@ unsafe fn read_ready<B: BufMut>(buf: &mut B, raw_fd: RawFd) -> isize {
                 iovecs.len() as i32)
 }
 
-impl<'a> AsyncRead for &'a UnixStream {
-    unsafe fn prepare_uninitialized_buffer(&self, _: &mut [u8]) -> bool {
-        false
-    }
-
-    fn read_buf<B: BufMut>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
-        if let Async::NotReady = <UnixStream>::poll_read(self) {
-            return Ok(Async::NotReady)
-        }
-        unsafe {
-            let r = read_ready(buf, self.as_raw_fd());
-            if r == -1 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.need_read();
-                    Ok(Async::NotReady)
-                } else {
-                    Err(e)
-                }
-            } else {
-                let r = r as usize;
-                buf.advance_mut(r);
-                Ok(r.into())
-            }
-        }
-    }
-}
-
 unsafe fn write_ready<B: Buf>(buf: &mut B, raw_fd: RawFd) -> isize {
     // The `IoVec` type can't have a zero-length size, so create a dummy
     // version from a 1-length slice which we'll overwrite with the
@@ -480,34 +420,6 @@ unsafe fn write_ready<B: Buf>(buf: &mut B, raw_fd: RawFd) -> isize {
     libc::writev(raw_fd,
                 iovecs.as_ptr(),
                 iovecs.len() as i32)
-}
-
-impl<'a> AsyncWrite for &'a UnixStream {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        Ok(().into())
-    }
-
-    fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Poll<usize, io::Error> {
-        if let Async::NotReady = <UnixStream>::poll_write(self) {
-            return Ok(Async::NotReady)
-        }
-        unsafe {
-            let r = write_ready(buf, self.as_raw_fd());
-            if r == -1 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    self.io.need_write();
-                    Ok(Async::NotReady)
-                } else {
-                    Err(e)
-                }
-            } else {
-                let r = r as usize;
-                buf.advance(r);
-                Ok(r.into())
-            }
-        }
-    }
 }
 
 impl fmt::Debug for UnixStream {
@@ -583,35 +495,13 @@ impl UnixDatagram {
         self.io.get_ref().connect(path)
     }
 
-    /// Indicates to this source of events that the corresponding I/O object is
-    /// no longer readable, but it needs to be.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn need_read(&self) {
-        self.io.need_read()
-    }
-
-    /// Indicates to this source of events that the corresponding I/O object is
-    /// no longer writable, but it needs to be.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if called outside the context of a future's
-    /// task.
-    pub fn need_write(&self) {
-        self.io.need_write()
-    }
-
     /// Test whether this socket is ready to be read or not.
-    pub fn poll_read(&self) -> Async<()> {
+    pub fn poll_read(&mut self) -> Async<()> {
         self.io.poll_read()
     }
 
     /// Test whether this socket is ready to be written to or not.
-    pub fn poll_write(&self) -> Async<()> {
+    pub fn poll_write(&mut self) -> Async<()> {
         self.io.poll_write()
     }
 
@@ -631,13 +521,13 @@ impl UnixDatagram {
     ///
     /// On success, returns the number of bytes read and the address from
     /// whence the data came.
-    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+    pub fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         if self.io.poll_read().is_not_ready() {
             return Err(would_block())
         }
         let r = self.io.get_ref().recv_from(buf);
         if is_wouldblock(&r) {
-            self.io.need_read();
+            self.io.need_read()?;
         }
         return r
     }
@@ -645,13 +535,13 @@ impl UnixDatagram {
     /// Receives data from the socket.
     ///
     /// On success, returns the number of bytes read.
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+    pub fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.io.poll_read().is_not_ready() {
             return Err(would_block())
         }
         let r = self.io.get_ref().recv(buf);
         if is_wouldblock(&r) {
-            self.io.need_read();
+            self.io.need_read()?;
         }
         return r
     }
@@ -671,7 +561,7 @@ impl UnixDatagram {
     /// Sends data on the socket to the specified address.
     ///
     /// On success, returns the number of bytes written.
-    pub fn send_to<P>(&self, buf: &[u8], path: P) -> io::Result<usize>
+    pub fn send_to<P>(&mut self, buf: &[u8], path: P) -> io::Result<usize>
         where P: AsRef<Path>
     {
         if self.io.poll_write().is_not_ready() {
@@ -679,7 +569,7 @@ impl UnixDatagram {
         }
         let r = self.io.get_ref().send_to(buf, path);
         if is_wouldblock(&r) {
-            self.io.need_write();
+            self.io.need_write()?;
         }
         return r
     }
@@ -690,13 +580,13 @@ impl UnixDatagram {
     /// will return an error if the socket has not already been connected.
     ///
     /// On success, returns the number of bytes written.
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+    pub fn send(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.io.poll_write().is_not_ready() {
             return Err(would_block())
         }
         let r = self.io.get_ref().send(buf);
         if is_wouldblock(&r) {
-            self.io.need_write();
+            self.io.need_write()?;
         }
         return r
     }
@@ -804,7 +694,7 @@ impl<T, P> Future for SendDgram<T, P>
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if let SendDgramState::Sending { ref sock, ref buf, ref addr } = self.st {
+        if let SendDgramState::Sending { ref mut sock, ref buf, ref addr } = self.st {
             let n = try_nb!(sock.send_to(buf.as_ref(), addr));
             if n < buf.as_ref().len() {
                 return Err(io::Error::new(io::ErrorKind::Other,
@@ -854,7 +744,7 @@ impl<T> Future for RecvDgram<T>
         let received;
         let peer;
 
-        if let RecvDgramState::Receiving { ref sock, ref mut buf } = self.st {
+        if let RecvDgramState::Receiving { ref mut sock, ref mut buf } = self.st {
             let (n, p) = try_nb!(sock.recv_from(buf.as_mut()));
             received = n;
 
